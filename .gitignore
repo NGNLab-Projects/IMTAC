@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.so
+*.a
+cmake_targets/ran_build/
+
+# Logs and data
+*.log
+*.csv
+*.iqs
+
+# Large binaries (ONNX Runtime, LibTorch)
+onnxruntime/lib/
+libtorch/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

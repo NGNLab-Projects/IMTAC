@@ -1,0 +1,435 @@
+classdef GSM_D3QN_Env < rl.env.MATLABEnvironment
+    properties
+        % ── Hardcoded GSM config table ─────────────────────────────────────
+        % Each row is one allowed [Nt, Na] pair.
+        % alpha action (0-based) indexes into this table: alpha=0 → row 1, etc.
+        VALID_CONFIGS = [
+             8,  2;
+             8,  4;
+            16,  4;
+            16,  8;
+            32,  2;];
+        tx_ants           % Nt: set from chosen config at each step
+        act_ants          % Na: set from chosen config at each step
+        SNR_dB
+        harq_ack_nack
+        raw_channel
+        local_channel
+        csi_vector
+        prev_mcs_ind     
+        prev_alpha
+        normalized_snr
+    end
+    properties(Access = protected)
+        IsDone = false
+    end
+    methods
+        function this = GSM_D3QN_Env()
+            ObservationInfo = rlNumericSpec([260 1]);
+            ObservationInfo.Name = 'Wireless Observation';
+            % Act1: config selection — 5 allowed (Nt,Na) pairs (0-indexed)
+            % Act2: MCS tens digit  — beta  in {0,1,2,3,4}
+            % Act3: MCS units digit — gamma in {0,1,2,3,4}
+            % mcs_ind = beta*5 + gamma  →  range [0,24]  (25 MCS entries)
+            Act1 = rlFiniteSetSpec(0:4);   % 5 combinations
+            Act2 = rlFiniteSetSpec(0:4);   % beta
+            Act3 = rlFiniteSetSpec(0:4);   % gamma
+            ActionInfo = [Act1; Act2; Act3];
+            this = this@rl.env.MATLABEnvironment(ObservationInfo, ActionInfo);
+            reset(this);
+        end
+        function [Observation,Reward,IsDone,Info] = step(this,Action)
+            Info = [];
+            if iscell(Action)
+                Action = cell2mat(Action);
+            end
+            % ── Action decoding ────────────────────────────────────────────
+            alpha = Action(1);   % config index, 0-based → rows of VALID_CONFIGS
+            beta  = Action(2);   % MCS tens digit
+            gamma = Action(3);   % MCS units digit
+            % GSM config: alpha selects (Nt,Na) pair from hardcoded table
+            cfg_idx       = alpha + 1;                          % 1-based row index
+            this.tx_ants  = this.VALID_CONFIGS(cfg_idx, 1);    % Nt
+            this.act_ants = this.VALID_CONFIGS(cfg_idx, 2);    % Na
+            % MCS index (0-based, into mcs_vals from mcstable3gpp)
+            mcs_ind = beta * 5 + gamma;   % range [0,24]
+            % ── Local aliases ──────────────────────────────────────────────
+            tx_ants  = this.tx_ants;
+            act_ants = this.act_ants;
+            % ── GSM combination table for chosen config ────────────────────
+            all_combos      = nchoosek(1:tx_ants, act_ants);
+            num_combos      = size(all_combos, 1);
+            gsm_idx_bits    = floor(log2(num_combos));
+            num_used_combos = 2^gsm_idx_bits;
+            % ── Simulation parameters ──────────────────────────────────────
+            simParameters = struct();
+            simParameters.NFrames = 1;
+            simParameters.NTxAnts = 1;
+            simParameters.NRxAnts = 4;
+            simParameters.DataType = 'single';
+            simParameters.Prototype = zeros(0,0,simParameters.DataType);
+            simParameters.Carrier = nrCarrierConfig;
+            simParameters.Carrier.NSizeGrid = 51;
+            simParameters.Carrier.SubcarrierSpacing = 30;
+            simParameters.Carrier.CyclicPrefix = 'Normal';
+            simParameters.Carrier.NCellID = 1;
+            simParameters.PDSCH = nrPDSCHConfig;
+            simParameters.PDSCHExtension = struct();
+            simParameters.PDSCH.PRBSet = 0:simParameters.Carrier.NSizeGrid-1;
+            simParameters.PDSCH.SymbolAllocation = [0,simParameters.Carrier.SymbolsPerSlot];
+            simParameters.PDSCH.MappingType = 'A';
+            simParameters.PDSCH.NID = simParameters.Carrier.NCellID;
+            simParameters.PDSCH.RNTI = 1;
+            simParameters.PDSCH.VRBToPRBInterleaving = 0;
+            simParameters.PDSCH.VRBBundleSize = 4;
+            simParameters.PDSCH.DMRS.DMRSTypeAPosition = 2;
+            simParameters.PDSCH.DMRS.DMRSLength = 1;
+            simParameters.PDSCH.DMRS.DMRSAdditionalPosition = 2;
+            simParameters.PDSCH.DMRS.DMRSConfigurationType = 2;
+            simParameters.PDSCH.DMRS.NumCDMGroupsWithoutData = 1;
+            simParameters.PDSCH.DMRS.NIDNSCID = 1;
+            simParameters.PDSCH.DMRS.NSCID = 0;
+            simParameters.PDSCHExtension.PRGBundleSize = [];
+            simParameters.PDSCHExtension.XOverhead = 0;
+            simParameters.PDSCHExtension.NHARQProcesses = 5;
+            simParameters.PDSCHExtension.EnableHARQ = true;
+            simParameters.PDSCHExtension.EnableCBGTransmission = false;
+            simParameters.PDSCHExtension.MaxNumCBG = 4;
+            rvSeq = [0 2 3 1];
+            simParameters.PDSCHExtension.LDPCDecodingAlgorithm = 'Normalized min-sum';
+            simParameters.PDSCHExtension.MaximumLDPCIterationCount = 6;
+            waveformInfo = nrOFDMInfo(simParameters.Carrier);
+            mcstable3gpp
+            mod_scheme = mcs_vals{mcs_ind+1,2};
+            code_rate  = mcs_vals{mcs_ind+1,3};
+            simParameters.SNRIn = this.SNR_dB;
+            simParameters.PDSCH.NumLayers = 1;
+            simParameters.PDSCH.Modulation = mod_scheme;
+            simParameters.PDSCHExtension.TargetCodeRate = code_rate;
+            simParameters.PDSCH.DMRS.DMRSPortSet = 0:simParameters.PDSCH.NumLayers-1;
+            % ────────────────── Channel ────────────────────────────────────
+            % raw_channel was generated for Nt=32 in reset().
+            % Slice to the Nt columns needed by the chosen config.
+            channel     = this.local_channel;
+            chInfo      = info(channel);
+            maxChDelay  = chInfo.MaximumChannelDelay;
+            % Slice channel estimate: raw_channel is [K x L x Nr x 32]
+            estChannelGridAnts = this.raw_channel(:,:,:,1:tx_ants);
+            maxThroughput = zeros(length(simParameters.SNRIn),1);
+            simThroughput = zeros(length(simParameters.SNRIn),1);
+            % totalAntBitErrors = zeros(length(simParameters.SNRIn), 1);
+            % totalAntBits      = zeros(length(simParameters.SNRIn), 1);
+            encodeDLSCH = nrDLSCH;
+            encodeDLSCH.MultipleHARQProcesses = true;
+            encodeDLSCH.CBGTransmission = true;
+            encodeDLSCH.TargetCodeRate = simParameters.PDSCHExtension.TargetCodeRate;
+            decodeDLSCH = nrDLSCHDecoder;
+            decodeDLSCH.MultipleHARQProcesses = true;
+            decodeDLSCH.CBGTransmission = true;
+            decodeDLSCH.TargetCodeRate = simParameters.PDSCHExtension.TargetCodeRate;
+            decodeDLSCH.LDPCDecodingAlgorithm = simParameters.PDSCHExtension.LDPCDecodingAlgorithm;
+            decodeDLSCH.MaximumLDPCIterationCount = simParameters.PDSCHExtension.MaximumLDPCIterationCount;
+            simLocal        = simParameters;
+            waveinfoLocal   = waveformInfo;
+            carrier         = simLocal.Carrier;
+            pdsch           = simLocal.PDSCH;
+            pdschextra      = simLocal.PDSCHExtension;
+            decodeDLSCHLocal = decodeDLSCH;
+            decodeDLSCHLocal.reset();
+            pathFilters = [];
+            SNRdB = simLocal.SNRIn;
+            harqSequence = 0:pdschextra.NHARQProcesses-1;
+            maxNumCBG = 1;
+            harqEntity = HARQEntity(harqSequence,rvSeq,pdsch.NumCodewords,maxNumCBG);
+            NSlots = simLocal.NFrames * carrier.SlotsPerFrame;
+            newWtx = hSVDPrecoders(carrier, pdsch, estChannelGridAnts(:,:,:,1), pdschextra.PRGBundleSize);
+            harqvals = zeros(1,NSlots);
+            offset = 0;
+            SNR  = 10^(SNRdB/10);
+            N0   = 1/sqrt(simLocal.NRxAnts*double(waveinfoLocal.Nfft)*SNR);
+            nVar = N0^2*double(waveinfoLocal.Nfft);
+            totalAntBitErrors = 0;
+            totalAntBitsSent  = 0;
+            for nslot = 0:NSlots-1
+                carrier.NSlot = nslot;
+                [pdschIndices,pdschIndicesInfo] = nrPDSCHIndices(carrier,pdsch);
+                trBlkSizes = nrTBS(pdsch.Modulation,pdsch.NumLayers, ...
+                    numel(pdsch.PRBSet),pdschIndicesInfo.NREPerPRB, ...
+                    pdschextra.TargetCodeRate,pdschextra.XOverhead);
+                for cwIdx = 1:pdsch.NumCodewords
+                    if harqEntity.NewData(cwIdx)
+                        trBlk = randi([0 1],trBlkSizes(cwIdx),1,'like',simLocal.Prototype);
+                        setTransportBlock(encodeDLSCH,double(trBlk),cwIdx-1,harqEntity.HARQProcessID);
+                        if harqEntity.SequenceTimeout(cwIdx)
+                            resetSoftBuffer(decodeDLSCHLocal,cwIdx-1,harqEntity.HARQProcessID);
+                        end
+                    end
+                end
+                % ── GSM codebook lookup ────────────────────────────────────
+                a_bits = randi([0 1], 1, gsm_idx_bits);
+                [H_ant, sm_ant_indices] = GSM_Codebook(estChannelGridAnts, a_bits, ...
+                    tx_ants, act_ants, all_combos, num_used_combos);
+                codedTrBlocks = encodeDLSCH(pdsch.Modulation,pdsch.NumLayers, ...
+                    pdschIndicesInfo.G,harqEntity.RedundancyVersion, ...
+                    harqEntity.HARQProcessID,harqEntity.CBGTI);
+                wtx = newWtx;
+                pdschGrid = zeros(carrier.NSizeGrid*12, ...
+                    carrier.SymbolsPerSlot,simLocal.NTxAnts,"like",simLocal.Prototype);
+                pdschSymbols = nrPDSCH(carrier,pdsch,codedTrBlocks);
+                [pdschAntSymbols,pdschAntIndices] = ...
+                    nrPDSCHPrecode(carrier,pdschSymbols,pdschIndices,wtx);
+                pdschGrid(pdschAntIndices) = pdschAntSymbols;
+                dmrsSymbols = nrPDSCHDMRS(carrier,pdsch);
+                dmrsIndices = nrPDSCHDMRSIndices(carrier,pdsch);
+                [dmrsAntSymbols,dmrsAntIndices] = ...
+                    nrPDSCHPrecode(carrier,dmrsSymbols,dmrsIndices,wtx);
+                pdschGrid(dmrsAntIndices) = dmrsAntSymbols;
+                ptrsSymbols = nrPDSCHPTRS(carrier,pdsch);
+                ptrsIndices = nrPDSCHPTRSIndices(carrier,pdsch);
+                [ptrsAntSymbols,ptrsAntIndices] = ...
+                    nrPDSCHPrecode(carrier,ptrsSymbols,ptrsIndices,wtx);
+                pdschGrid(ptrsAntIndices) = ptrsAntSymbols;
+                txWaveform1 = nrOFDMModulate(carrier, pdschGrid);
+                % GSM broadcast: replicate onto active antennas
+                % tx_ants columns; zero everywhere except sm_ant_indices
+                MAX_ANT = size(this.raw_channel, 4);   % = 32, from reset()
+                txWaveform_mimo = zeros(size(txWaveform1,1), MAX_ANT, 'like', txWaveform1);
+                txWaveform_mimo(:, sm_ant_indices) = ...
+                    repmat(txWaveform1, 1, act_ants) * (1/sqrt(act_ants));
+                txWaveform = txWaveform_mimo;
+                txWaveform = [txWaveform; zeros(maxChDelay, size(txWaveform,2))]; %#ok<AGROW>
+                [rxWaveform,ofdmResponse,timingOffset] = channel(double(txWaveform),carrier);
+                noise      = N0*randn(size(rxWaveform),"like",rxWaveform);
+                rxWaveform = rxWaveform + noise;
+                offset     = timingOffset;
+                rxWaveform = rxWaveform(1+offset:end,:);
+                rxGrid = nrOFDMDemodulate(carrier,rxWaveform);
+                [K,L,R] = size(rxGrid);
+                if (L < carrier.SymbolsPerSlot)
+                    rxGrid = cat(2,rxGrid,zeros(K,carrier.SymbolsPerSlot-L,R));
+                end
+                % ──────── ML detection (Jeganathan metric) ──────────────────────
+                H_full       = single(ofdmResponse(:,:,:,1:tx_ants));
+                rxGridDouble = single(rxGrid);
+                [kIdx, lIdx, ~] = ind2sub([carrier.NSizeGrid*12, ...
+                    carrier.SymbolsPerSlot, simLocal.NTxAnts], pdschIndices);
+                klIdx = sub2ind([carrier.NSizeGrid*12, carrier.SymbolsPerSlot], kIdx, lIdx);
+                nRx_   = size(H_full, 3);
+                Y      = reshape(rxGridDouble, [], nRx_);
+                H_flat = reshape(H_full,       [], nRx_, tx_ants);
+                mlStride = 8;
+                klIdx_ml = klIdx(1:mlStride:end);
+                nRE_sub  = numel(klIdx_ml);
+                Y_ml     = Y(klIdx_ml, :);
+                H_ml     = H_flat(klIdx_ml, :, :);
+                Y_ml3    = reshape(Y_ml, nRE_sub, nRx_, 1);
+                chunkSize = 2048;
+                mlMetric  = zeros(num_used_combos, 1, 'single');
+                for cStart = 1:chunkSize:num_used_combos
+                    cEnd = min(cStart + chunkSize - 1, num_used_combos);
+                    nC   = cEnd - cStart + 1;
+                    idx_c   = all_combos(cStart:cEnd, :);
+                    H_c_raw = H_ml(:, :, idx_c);
+                    H_c4 = reshape(H_c_raw, nRE_sub, nRx_, nC, act_ants);
+                    H_c4 = permute(H_c4, [1 2 4 3]);
+                    H_c  = reshape(sum(H_c4, 3), nRE_sub, nRx_, nC) / sqrt(single(act_ants));
+                    hHy_c = sum(conj(H_c) .* Y_ml3, 2);
+                    num_c = abs(hHy_c).^2;
+                    den_c = sum(real(conj(H_c) .* H_c), 2);
+                    mlMetric(cStart:cEnd) = reshape( ...
+                        sum(num_c ./ max(den_c, single(1e-7)), 1), nC, 1);
+                end
+                [~, estComboIdx] = max(mlMetric);
+                estBits_ant  = de2bi(estComboIdx - 1, gsm_idx_bits, 'left-msb');
+                antBitErrors = sum(a_bits ~= estBits_ant);
+                totalAntBitErrors = totalAntBitErrors + antBitErrors;
+                totalAntBitsSent  = totalAntBitsSent + gsm_idx_bits;
+                est_ant_indices       = all_combos(estComboIdx, :);
+                estChannelGridAnts_eq = sum(ofdmResponse(:,:,:,est_ant_indices), 4) / sqrt(act_ants);
+                noiseEst = nVar;
+                [pdschRx, pdschHest] = nrExtractResources(pdschIndices, rxGrid, estChannelGridAnts_eq);
+                [pdschEq, csi] = nrEqualizeMMSE(pdschRx, pdschHest, noiseEst);
+                if ~isempty(ptrsIndices)
+                    tempGrid = nrResourceGrid(carrier, pdsch.NumLayers);
+                    [ptrsRx, ptrsHest, ~, ~, ptrsHestIndices, ptrsLayerIndices] = ...
+                        nrExtractResources(ptrsIndices, rxGrid, estChannelGridAnts_eq, tempGrid);
+                    ptrsHest = nrPDSCHPrecode(carrier, ptrsHest, ptrsHestIndices, permute(wtx,[2 1 3]));
+                    ptrsEq   = nrEqualizeMMSE(ptrsRx, ptrsHest, noiseEst);
+                    tempGrid(ptrsLayerIndices) = ptrsEq;
+                    cpe = nrChannelEstimate(tempGrid, ptrsIndices, ptrsSymbols);
+                    cpe = angle(sum(cpe,[1 3 4]));
+                    tempGrid(pdschIndices) = pdschEq;
+                    symLoc = pdschIndicesInfo.PTRSSymbolSet(1)+1:pdschIndicesInfo.PTRSSymbolSet(end)+1;
+                    tempGrid(:,symLoc,:) = tempGrid(:,symLoc,:) .* exp(-1i*cpe(symLoc));
+                    pdschEq = tempGrid(pdschIndices);
+                end
+                [dlschLLRs,rxSymbols] = nrPDSCHDecode(carrier,pdsch,pdschEq,noiseEst);
+                csi = nrLayerDemap(csi);
+                for cwIdx = 1:pdsch.NumCodewords
+                    Qm = length(dlschLLRs{cwIdx})/length(rxSymbols{cwIdx});
+                    csi{cwIdx} = repmat(csi{cwIdx}.',Qm,1);
+                    dlschLLRs{cwIdx} = dlschLLRs{cwIdx} .* csi{cwIdx}(:);
+                end
+                decodeDLSCHLocal.TransportBlockLength = trBlkSizes;
+                [decbits,blkerr,cbgerr] = decodeDLSCHLocal(dlschLLRs, ...
+                    pdsch.Modulation,pdsch.NumLayers,harqEntity.RedundancyVersion, ...
+                    harqEntity.HARQProcessID,harqEntity.CBGTI);
+                simThroughput = simThroughput + sum(~blkerr .* trBlkSizes);
+                maxThroughput = maxThroughput + sum(trBlkSizes);
+                procstatus = updateAndAdvance(harqEntity,blkerr,trBlkSizes,pdschIndicesInfo.G,cbgerr);
+                newWtx = hSVDPrecoders(carrier, pdsch, estChannelGridAnts_eq, pdschextra.PRGBundleSize);
+                harqvals(nslot+1) = ~blkerr;
+            end
+            totalCorrectAntBits = totalAntBitsSent - totalAntBitErrors;
+            totalCorrectAntBits = max(0, totalCorrectAntBits); 
+            totalFrameTimeSec = simLocal.NFrames * 10e-3;
+            achiev_thr = 1e-6*simThroughput/(simLocal.NFrames*10e-3);
+            achiev_thr_spatial = 1e-6 * (totalCorrectAntBits / totalFrameTimeSec);
+            this.harq_ack_nack = mean(harqvals);
+            frame_bler = 1 - this.harq_ack_nack;
+            dataRow = [];
+            dataRow = [achiev_thr, achiev_thr_spatial, this.SNR_dB, mcs_ind, tx_ants, act_ants];
+            % ────────────── SNR random walk for next step ───────────────────
+            % delta_snr    = randi([-2,2],1);
+            % this.SNR_dB  = this.SNR_dB + delta_snr;
+            % this.SNR_dB  = max(-20, min(35, this.SNR_dB));
+            % snr_min      = -20;
+            % snr_max      = 35;
+            % normalized_snr = 2 * (this.SNR_dB - snr_min) / (snr_max - snr_min) - 1;
+            % ────────────── Normalize for agent ───────────────────
+            norm_prev_mcs   = this.prev_mcs_ind / 24;   
+            norm_prev_alpha = this.prev_alpha / 4;
+            % ────────────── Observation and Reward ───────────────────
+            Observation = [this.normalized_snr; this.harq_ack_nack; norm_prev_mcs; norm_prev_alpha; this.csi_vector];
+            bler_penalty_factor = 2.0;
+            max_thr     = 118.0;   % theoretical peak Mbps
+            norm_thr    = achiev_thr / max_thr;      % [0, 1]
+            
+            max_spatial_capacity_Mbps = 1e-6 * gsm_idx_bits * NSlots / totalFrameTimeSec;
+            if max_spatial_capacity_Mbps > 0
+                norm_thr_sp = min(achiev_thr_spatial / max_spatial_capacity_Mbps, 1.0);
+            else
+                norm_thr_sp = 0;
+            end
+            Reward = norm_thr + norm_thr_sp - (bler_penalty_factor * frame_bler);
+            % fprintf('[R] norm_thr=%.4f | norm_thr_sp=%.4f | bler_penalty=%.4f | frame_bler=%.4f | R=%.4f\n', ...
+            %     norm_thr, norm_thr_sp, bler_penalty_factor * frame_bler, frame_bler, Reward);
+            % ────────────── Save current actions as previous indices for next step ───────────────────
+            this.prev_mcs_ind = mcs_ind;
+            this.prev_alpha   = alpha;
+            % ────────────── Log the values in excel ───────────────────
+            dataRow = [dataRow, this.harq_ack_nack, Reward];
+            writematrix(dataRow, 'GSM_DRL_july06.csv', 'WriteMode', 'append');
+            IsDone = false;
+        end
+        function Observation = reset(this)
+            % Channel always generated for max Nt=32.
+            % step() slices raw_channel to the Nt columns of the chosen config.
+            [this.raw_channel, this.local_channel, ~] = SRS_Channel_gen(32);
+            H_wb = squeeze(mean(this.raw_channel, [1 2]));   % 4 x 32
+            frob_norm = norm(H_wb, 'fro');
+            if frob_norm > 1e-8
+                H_wb = H_wb / frob_norm; % Total matrix energy is now 1
+            end
+            H_wb_vect = reshape(H_wb,1,[]);
+            H_wb_final = zeros(1,2*length(H_wb_vect));
+            H_wb_final(1:2:length(H_wb_final)) = real(H_wb_vect);
+            H_wb_final(2:2:length(H_wb_final)) = imag(H_wb_vect);
+            this.csi_vector = H_wb_final';
+            % Initialise tx_ants/act_ants to a random valid config
+            % so that properties are never uninitialised before first step().
+            cfg_idx      = randi(size(this.VALID_CONFIGS, 1));
+            this.tx_ants  = this.VALID_CONFIGS(cfg_idx, 1);
+            this.act_ants = this.VALID_CONFIGS(cfg_idx, 2);
+            % Initialize default states for step 1 tracking context
+            this.prev_mcs_ind = 0;
+            this.prev_alpha   = cfg_idx - 1; % 0-based index
+            % Normalize current states
+            norm_prev_mcs   = this.prev_mcs_ind / 24;
+            norm_prev_alpha = this.prev_alpha / 4;
+            % Random starting SNR
+            this.SNR_dB = randi([-20,35],1);
+            snr_min     = -20;
+            snr_max     = 35;
+            this.normalized_snr = 2*(this.SNR_dB - snr_min)/(snr_max - snr_min) - 1;
+            this.harq_ack_nack = 0;
+            Observation = [this.normalized_snr; this.harq_ack_nack; norm_prev_mcs; norm_prev_alpha; this.csi_vector];
+        end
+    end
+end
+% =========================================================================
+%  LOCAL FUNCTIONS
+% =========================================================================
+function [Wprg,Hprg] = hSVDPrecoders(carrier,pdsch,H,prgsize)
+    prgInfo = nrPRGInfo(carrier,prgsize);
+    gridrbset = getGridRBSet(carrier,pdsch);
+    [K,L,R,P] = size(H);
+    H = reshape(H,[12 K/12 L R P]);
+    H = mean(H,[1 3]);
+    H = H(:,gridrbset + 1,:,:,:);
+    H = permute(H,[4 5 2 1 3]);
+    nu = pdsch.NumLayers;
+    Wprg = zeros([nu P prgInfo.NPRG]);
+    Hprg = zeros([R P prgInfo.NPRG]);
+    pdschPRGs = prgInfo.PRGSet(gridrbset + 1);
+    uprg = unique(pdschPRGs).';
+    for i = uprg
+        Hprb = H(:,:,pdschPRGs==i);
+        nz = ~all(Hprb==0,[1 2]);
+        Hprg(:,:,i) = mean(Hprb(:,:,nz),3);
+        [~,~,V] = svd(Hprg(:,:,i));
+        W = permute(V(:,1:nu,:),[2 1 3]);
+        W = W / sqrt(nu);
+        Wprg(:,:,i) = W;
+    end
+end
+function gridrbset = getGridRBSet(carrier,pdsch)
+    if (pdsch.VRBToPRBInterleaving)
+        [~,indinfo] = nrPDSCHIndices(carrier,pdsch);
+        gridrbset = indinfo.PRBSet;
+    else
+        gridrbset = pdsch.PRBSet;
+    end
+    if (isempty(pdsch.NStartBWP))
+        bwpOffset = 0;
+    else
+        bwpOffset = pdsch.NStartBWP - carrier.NStartGrid;
+    end
+    gridrbset = gridrbset + bwpOffset;
+end
+function cdl = hArrayGeometry(cdl,NTxAnts,NRxAnts,varargin)
+    if (nargin==3)
+        linkDirection = 'downlink';
+    else
+        linkDirection = varargin{1};
+    end
+    if (strcmpi(linkDirection,'downlink'))
+        txArray = bsArrayGeometry(cdl.TransmitAntennaArray,NTxAnts);
+        rxArray = ueArrayGeometry(cdl.ReceiveAntennaArray,NRxAnts);
+    else
+        txArray = ueArrayGeometry(cdl.TransmitAntennaArray,NTxAnts);
+        rxArray = bsArrayGeometry(cdl.ReceiveAntennaArray,NRxAnts);
+    end
+    cdl.TransmitAntennaArray = txArray;
+    cdl.ReceiveAntennaArray  = rxArray;
+end
+function array = bsArrayGeometry(array,nBsAnts)
+    antArraySizes = ...
+       [1   1   1   1   1;
+        1   1   2   1   1;
+        2   1   2   1   1;
+        2   2   2   1   1;
+        2   4   2   1   1;
+        4   4   2   1   1;
+        4   4   2   1   2;
+        4   8   2   1   2;
+        4   8   2   2   2;
+        8   8   2   2   2;
+        8  16   2   2   2];
+    antselected = min(1+ceil(log2(nBsAnts)),size(antArraySizes,1));
+    array.Size = antArraySizes(antselected,:);
+    array.ElementSpacing(3) = array.Size(1)*array.ElementSpacing(1);
+    array.ElementSpacing(4) = array.Size(2)*array.ElementSpacing(2);
+end
+function array = ueArrayGeometry(array,nUeAnts)
+    if nUeAnts == 1
