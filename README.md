@@ -96,8 +96,6 @@ cd openairinterface5g
 git checkout 2026.w35
 ```
 
-> ⚠️ Use exactly **tag `2026.w35`**. Newer commits may have context drift requiring manual patch adjustment.
-
 ### 2. Build OAI (Base Stack)
 
 ```bash
@@ -185,34 +183,6 @@ python3 mcs_xapp_workspace/scripts/run_baseline.py
 python3 mcs_xapp_workspace/scripts/plot_live.py
 ```
 
----
-
-## System Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│                   OAI gNB                       │
-│  MAC Scheduler (gNB_scheduler_dlsch.c)          │
-│    │                                            │
-│    ├──► onnx_agent.c ◄── GSM_D3QN_online.onnx   │
-│    │    Inputs: SRS H[32×4 complex], SNR,       │
-│    │            prev_MCS, HARQ, alpha           │
-│    │    Outputs: MCS index, alpha               │
-│    │                                            │
-│    └──► cqi_udp_listener.c (telemetry UDP)      │
-│                                                 │
-│  RF Simulator ◄──► nr-uesoftmodem               │
-└─────────────────────────────────────────────────┘
-          │ UDP
-          ▼
-  collect_telemetry.py → session_log_*.csv
-          │
-          ▼
-    plot_live.py / sweep_snr_gsm.py
-```
-
----
-
 ## Key Modified Files
 
 | File | Nature of Change |
@@ -228,17 +198,6 @@ python3 mcs_xapp_workspace/scripts/plot_live.py
 
 ---
 
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `libonnxruntime.so: cannot open shared object file` | `export LD_LIBRARY_PATH=<OAI>/onnxruntime/lib:$LD_LIBRARY_PATH` |
-| ONNX input shape mismatch | Run `python3 test_onnx_model.py` |
-| RRC connection timeout | Set `min_rxtxtime ≥ 6` in gNB conf |
-| Throughput stuck at 0 | Check `telemetry.log` for `dlsch_bytes > 0` |
-| gNB crash in scheduler | Look for `[ONNX] Agent initialized` in log |
-
----
 
 ## License
 
