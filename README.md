@@ -187,11 +187,11 @@ python3 mcs_xapp_workspace/scripts/plot_live.py
 
 | File | Nature of Change |
 |---|---|
-| `openair2/LAYER2/NR_MAC_gNB/onnx_agent.c` | **NEW** — ONNX Runtime inference wrapper |
-| `openair2/LAYER2/NR_MAC_gNB/onnx_agent.h` | **NEW** — C API: `init_onnx_agent`, `run_onnx_agent` |
+| `openair2/LAYER2/NR_MAC_gNB/onnx_agent.c` | **NEW** ONNX Runtime inference wrapper |
+| `openair2/LAYER2/NR_MAC_gNB/onnx_agent.h` | **NEW** C API: `init_onnx_agent`, `run_onnx_agent` |
 | `openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c` | Hook: replaces table MCS with agent output |
 | `openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h` | Adds `onnx_initialized`, `prev_mcs`, `alpha` fields |
-| `openair2/LAYER2/MAC/cqi_udp_listener.c` | **NEW** — UDP MAC statistics broadcaster |
+| `openair2/LAYER2/MAC/cqi_udp_listener.c` | **NEW** UDP MAC statistics broadcaster |
 | `openair1/PHY/INIT/nr_init.c` | SRS buffer for 32-antenna MIMO |
 | `openair1/PHY/NR_UE_ESTIMATION/nr_ue_measurements.c` | Exposes SRS H estimates to MAC |
 | `radio/rfsimulator/simulator.cpp` | CDL-C taps + SNR telnet control |
